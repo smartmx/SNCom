@@ -1,0 +1,46 @@
+# -*- coding: utf-8 -*-
+"""PyCom 基准生成（对拍 ③ display）。由 tools\\runcross.bat 调用，无命令行参数。
+职责：枚举 DAT 语料 → LineBuilder（cwd=PyCom 工程，app 包可直接导入）→ 基准 JSON。
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, r"F:\projects\sscom二次分析开发\Develop\win64")
+from app.core.display import LineBuilder          # noqa: E402
+
+
+def main():
+    dat_dir = r"F:\projects\sscom二次分析开发\sscom5131"
+    out_json = r"F:\projects\sscom二次分析开发\sncom\develop\tools\_cc_base.json"
+    dats = []
+    for f in os.listdir(dat_dir):
+        p = os.path.join(dat_dir, f)
+        if f.lower().endswith(".dat") and os.path.getsize(p) > 0:
+            dats.append(p)
+    result = {}
+    for dat in sorted(dats):
+        with open(dat, "rb") as fh:
+            data = fh.read()
+        b = LineBuilder(encoding="gbk", hex_mode=False, split=False, split_ms=20)
+        step = 1024
+        for off in range(0, len(data), step):      # 1KB 分块：跨包半截序列口径同 native
+            b.feed("rx", data[off:off + step], 1000.0, off)
+            b.maybe_flush(1001.0)
+        b.flush()
+        lines = []
+        meta = []
+        i = 0
+        while i < b.line_count():
+            l = b.line_at(i)
+            lines.append(l.text)
+            meta.append([l.nbytes, l.start_abs])
+            i += 1
+        result[dat] = {"lines": lines, "meta": meta}
+    with open(out_json, "w", encoding="utf-8") as fh:
+        json.dump(result, fh, ensure_ascii=False)
+    print("baseline:", len(result), "files")
+
+
+if __name__ == "__main__":
+    main()

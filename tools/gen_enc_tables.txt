@@ -1,0 +1,129 @@
+# -*- coding: utf-8 -*-
+# gen_enc_tables —— 生成各编码的 CPython 映射表（运行：python tools/gen_tables.bat 或
+# python tools/gen_enc_tables.txt，cwd=develop）。产出 src/core/enc_tables.h。
+# 覆盖：big5 / shift_jis / euc_jp / euc_kr（双字节表 + lead 位图 + 可选单字节直通区 +
+# euc_jp 0x8F 三字节罕用字表）与 cp1252（单字节表，Python undefined 字节 → 0xFFFF 哨兵）。
+# 背景：Windows CP950/932/EUC 与 CPython 存在少量码点分歧（big5 A145: Win U+2027 vs
+# Py U+2022；cp932 8160: Win U+FF5E vs Py U+301C 等），cp1252 的 0x81/8D/8F/90/9D 在
+# Python 为 undefined——查表后与 PyCom（Python codecs）逐码点一致（G3 ⑤ + H-3 编码收口）。
+# 替换语义（混合向量对拍实测定，docs/00 §25）：无效 lead → 1 FFFD 前进 1；lead 合法 +
+# 对查表失败 → 1 FFFD 且 trail 重新参与解析；悬空 lead 留尾巴（FlushFinal 逐字节 FFFD）。
+import sys
+
+# (Python 编码名, C++ 符号, 单字节直通区间(lo,hi) 或 None, 单字节偏移)
+ENCS = [
+    ("big5",      "kBig5", None,        0),
+    ("shift_jis", "kSjis", (0xA1, 0xDF), 0xFEC0),
+    ("euc_jp",    "kEucJp", None,       0),
+    ("euc_kr",    "kEucKr", None,       0),
+]
+SINGLE_ENC = ("cp1252", "kCp1252")   # 单字节表（256 项，undefined → 0xFFFF 哨兵；0x00→U+0000 合法）
+
+out = []
+out.append("// AUTO-GENERATED from CPython codecs (strict per-pair probe). DO NOT EDIT.")
+out.append("// big5/shift_jis/euc_jp/euc_kr/cp1252 映射表：Windows 代码页与 CPython 存在少量")
+out.append("// 码点分歧，查表后与 PyCom（Python codecs）逐码点一致（G3 ⑤ + H-3 编码收口）。")
+out.append("// 替换语义（对拍实测定）：无效 lead → 1 FFFD 前进 1；对查表失败 → 1 FFFD 且")
+out.append("// trail 重新参与解析；悬空 lead 留尾巴。value 0 = 非法（FFFD）。")
+out.append("#pragma once")
+out.append("#include <cstdint>")
+out.append("#include <cwchar>")
+out.append("namespace sncom {")
+out.append("struct EncPair { uint16_t key; uint16_t cp; };   // key=(lead-0x80)<<8|trail，升序")
+out.append("struct EncTbl {")
+out.append("    const wchar_t* name;")
+out.append("    const EncPair* data;")
+out.append("    int count;")
+out.append("    const unsigned char* leads;        // 256 位 lead 可能性位图")
+out.append("    unsigned char singleLo, singleHi;  // 单字节直通区间（0=无）")
+out.append("    uint16_t singleOff;                // 单字节映射偏移（sjis 半角片假名 +0xFEC0；0=原样）")
+out.append("    const EncPair* ext3;               // 3 字节序列表（euc_jp 0x8F 开头；可为 null）")
+out.append("    int ext3Count;")
+out.append("};")
+out.append("struct SingleEncTbl { const uint16_t* map; };  // 单字节编码：256 项，0xFFFF=undefined（FFFD）")
+
+for enc, sym, single, soff in ENCS:
+    entries = []
+    leads = set()
+    ext3 = []
+    for lead in range(0x80, 0x100):
+        if single and single[0] <= lead <= single[1]:
+            continue                             # sjis 半角片假名区：单字节直通，不进双字节表
+        for trail in range(0x00, 0x100):
+            try:
+                cp = bytes([lead, trail]).decode(enc)
+            except Exception:
+                continue
+            if len(cp) != 1:
+                raise SystemExit("multi-char mapping %s %02X %02X -> %r" % (enc, lead, trail, cp))
+            entries.append((((lead - 0x80) << 8) | trail, ord(cp)))
+            leads.add(lead)
+    entries.sort()
+    # euc_jp 0x8F 三字节罕用字：单独成表，键=(t1-0x80)<<8|t2
+    if enc == "euc_jp":
+        for t1 in range(0x80, 0x100):
+            for t2 in range(0x00, 0x100):
+                try:
+                    cp = bytes([0x8F, t1, t2]).decode(enc)
+                except Exception:
+                    continue
+                if len(cp) != 1:
+                    raise SystemExit("multi-char euc_jp 3byte %02X %02X -> %r" % (t1, t2, cp))
+                ext3.append((((t1 - 0x80) << 8) | t2, ord(cp)))
+        ext3.sort()
+    bits = bytearray(32)
+    for l in leads:
+        bits[l // 8] |= 1 << (l % 8)
+    out.append("inline const EncPair %sTable[] = {" % sym)
+    for i in range(0, len(entries), 6):
+        row = ",".join("{0x%04x,0x%04x}" % e for e in entries[i:i + 6])
+        out.append(row + ",")
+    out.append("};")
+    if ext3:
+        out.append("inline const EncPair %sExt3[] = {" % sym)
+        for i in range(0, len(ext3), 6):
+            row = ",".join("{0x%04x,0x%04x}" % e for e in ext3[i:i + 6])
+            out.append(row + ",")
+        out.append("};")
+    out.append("inline const unsigned char %sLeads[32] = {%s};" %
+               (sym, ",".join("0x%02x" % b for b in bits)))
+    lo, hi = single if single else (0, 0)
+    out.append('inline const EncTbl %s = { L"%s", %sTable, %d, %sLeads, %d, %d, 0x%04x, %s, %d };' %
+               (sym, enc, sym, len(entries), sym, lo, hi, soff,
+                (sym + "Ext3") if ext3 else "nullptr", len(ext3)))
+    print("%s: %d pairs, %d leads, %d ext3" % (enc, len(entries), len(leads), len(ext3)),
+          file=sys.stderr)
+
+# cp1252 单字节表
+senc, ssym = SINGLE_ENC
+smap = []
+for b in range(0x100):
+    try:
+        cp = bytes([b]).decode(senc)
+        smap.append(ord(cp))
+    except Exception:
+        smap.append(0xFFFF)                      # Python undefined → 哨兵（状态机 → FFFD；0x00 是合法 U+0000）
+out.append("inline const uint16_t %sMap[256] = {%s};" %
+           (ssym, ",".join("0x%04x" % v for v in smap)))
+print("%s: %d defined bytes" % (senc, sum(1 for v in smap if v != 0xFFFF)), file=sys.stderr)
+
+out.append("inline const EncTbl* EncTblOf(const std::wstring& enc) {")
+for enc, sym, _, _ in ENCS:
+    out.append('    if (enc == L"%s") return &%s;' % (enc, sym))
+out.append("    return nullptr;")
+out.append("}")
+out.append("inline uint16_t EncTblLookup(const EncPair* data, int count, uint16_t key) {")
+out.append("    int lo = 0, hi = count - 1;")
+out.append("    while (lo <= hi) {")
+out.append("        int mid = (lo + hi) / 2;")
+out.append("        if (data[mid].key == key) return data[mid].cp;")
+out.append("        if (data[mid].key < key) lo = mid + 1; else hi = mid - 1;")
+out.append("    }")
+out.append("    return 0;")
+out.append("}")
+out.append("} // namespace sncom")
+
+dst = "src/core/enc_tables.h"
+with open(dst, "w", encoding="utf-8", newline="\n") as f:
+    f.write("\n".join(out) + "\n")
+print("written", dst, file=sys.stderr)

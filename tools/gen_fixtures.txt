@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+# gen_fixtures —— 对拍夹具生成（运行：python tools/gen_fixtures.txt，cwd=develop）
+# 产出：_cc_dump/enc_<name>.bin（编码向量，仅收 Python 可干净解码的序列）
+#       _cc_dump/ms_edge.ini（多条 ini 畸形用例，ASCII）
+# 无效序列不进向量：Python errors="replace" 与 Win32 MB_ERR_INVALID_CHARS+Latin-1 兜底
+# 的替换符口径不同（已知差异，docs 登记）；向量只覆盖映射正确性。
+import os
+import sys
+
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cc_dump")
+os.makedirs(OUT, exist_ok=True)
+err = sys.stderr
+
+# ---- 编码向量（干净序列：映射正确性全覆盖）----
+ENCS = ["gbk", "big5", "gb18030", "shift_jis", "euc_jp", "euc_kr", "cp1252"]
+for enc in ENCS:
+    seqs = bytearray()
+    n = 0
+    for b in range(0x20, 0x100):                 # 单字节（0x00-0x1F 控制字符不进向量）
+        try:
+            bytes([b]).decode(enc)
+        except Exception:
+            continue
+        seqs += bytes([b]); n += 1
+    if enc != "cp1252":                          # 双字节全组合
+        for lo in range(0x81, 0x100):
+            for hi in list(range(0x40, 0x7F)) + list(range(0x80, 0x100)):
+                t = bytes([lo, hi])
+                try:
+                    t.decode(enc)
+                except Exception:
+                    continue
+                seqs += t; n += 1
+    if enc == "gb18030":                         # 四字节抽样
+        for a in range(0x81, 0x100, 7):
+            for b in range(0x30, 0x3A, 2):
+                for c in range(0x81, 0x100, 5):
+                    for d in range(0x30, 0x3A, 3):
+                        t = bytes([a, b, c, d])
+                        try:
+                            t.decode(enc)
+                        except Exception:
+                            continue
+                        seqs += t; n += 1
+    with open(os.path.join(OUT, "enc_%s.bin" % enc), "wb") as f:
+        f.write(bytes(seqs))
+    print("enc %-8s %6d seqs %8d bytes" % (enc, n, len(seqs)), file=err)
+
+# ---- 混合向量（H-3）：合法抽样 + 非法序列注入，1 字节分块喂（最苛刻边界）----
+# 每编码一份 mix_*.bin；非法模式：lead+0xFF、孤立 lead 收尾、非法单字节、ASCII 交错、
+# euc_jp 0x8E/0x8F 前缀坏尾、cp1252 undefined 字节。预期两侧逐码点一致（trail 重解析语义）。
+MIX_ENCS = ["gbk", "big5", "shift_jis", "euc_jp", "euc_kr", "cp1252", "gb18030"]
+for enc in MIX_ENCS:
+    seqs = bytearray()
+    if not enc.startswith("cp"):
+        with open(os.path.join(OUT, "enc_%s.bin" % enc), "rb") as f:
+            seqs += f.read()[:2048]              # 干净样本头部做底料
+    seqs += b"TEXT-"                             # ASCII 交错
+    seqs += b"\x81\xFF"                          # lead + 非法 trail
+    seqs += b"A\x80B"                            # 非法单字节夹 ASCII
+    if enc == "gbk":
+        seqs += b"\xFF\xC4\xE3"                  # 坏 lead + 合法对
+    else:
+        seqs += b"\xFF\xA1\x40"
+    if enc == "euc_jp":
+        seqs += b"\x8E\x41\x8E\xA1"              # 0x8E 坏尾 + 0x8E 合法半角
+        seqs += b"\x8F\xFF\xFF\x8F\xA1\xA1"      # 0x8F 坏尾 + 0x8F 合法三字节
+    if enc == "gb18030":
+        seqs += b"\x81\x30\x81\x30"              # 合法四字节 U+0080
+        seqs += b"\x81\x30\x81\x41"              # 四字节第 4 字节非法
+        seqs += b"\x81\x30\x41\x41"              # 四字节第 3 字节非法（延迟判定）
+        seqs += b"\x84\x31\xA5\x34"              # 四字节"洞"（区合法但无映射）
+        seqs += b"\x81\x3F\x80\xFF"              # L1 非法 + 单字节非法
+    if enc == "cp1252":
+        seqs = bytes(range(0x00, 0x100))         # 全 256 字节（含 5 个 undefined）
+    seqs += b"\xC4"                              # 孤立 lead 收尾（flush 逐字节 FFFD）
+    with open(os.path.join(OUT, "mix_%s.bin" % enc), "wb") as f:
+        f.write(bytes(seqs))
+    print("mix %-8s %6d bytes" % (enc, len(seqs)), file=err)
+
+# ---- 多条 ini 畸形用例（覆盖 docs/09 P3-3 三处口径 + 同名键覆盖 + 注释行 + 非法整数） ----
+edge = "\n".join([
+    "; comment line = should be skipped",
+    "N101=,1,note-a,500",
+    "N1=H,010203",
+    "N102=,2,note-b,12x",
+    "N2=A,hello world",
+    "N103=,3,",
+    "N3=HELLO,no-hex-tag",
+    "N104=,4,note-d,99999999",
+    "N4=plain-no-comma",
+    "N105=5,trailing,,",
+    "N5=H,",
+    "N1=dup-overwrite,ZZ",
+    "N201=,6,head-only,1000",
+])
+with open(os.path.join(OUT, "ms_edge.ini"), "w", encoding="ascii") as f:
+    f.write(edge + "\n")
+print("ms_edge.ini written", file=err)

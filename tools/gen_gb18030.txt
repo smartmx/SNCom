@@ -1,0 +1,96 @@
+# -*- coding: utf-8 -*-
+# gen_gb18030 —— 生成 gb18030 解码数据（运行：python tools/gen_gb18030.txt，cwd=develop）
+# 产出 src/core/gb18030_tables.h：
+#   1) 双字节表（gb18030 独立于 GBK 生成，EncPair 二分，value 0 = 非法对）
+#   2) 四字节段表（order 线性段：{startOrder, startCp, len}；cp 为 Unicode 算术码点，
+#      >0xFFFF 由状态机输出 UTF-16 代理对）——国家标准线性映射，CPython 同源
+#   3) lead 位图（双字节 lead 与 4 字节 lead 的并集，供 NORM 判定）
+# 四字节 order 公式：order = ((b0-0x81)*10+(b1-0x30))*1260 + (b2-0x81)*10 + (b3-0x30)
+# 替换语义（docs/00 §30 实测钉死）：
+#   L1 非法 trail → FFFD + trail 重解析；L2 非法 b3 → 延迟判定（write back b2,b3）；
+#   L3 非法 b4 → 立即 FFFD + write back b2,b3；任意未完序列 flush → 整体 1 FFFD。
+import sys
+
+out = []
+out.append("// AUTO-GENERATED from CPython gb18030 codec probe. DO NOT EDIT.")
+out.append("// 双字节表 + 四字节线性段表（docs/00 §30）。value 0 = 非法对。")
+out.append("#pragma once")
+out.append("#include <cstdint>")
+out.append("namespace sncom {")
+out.append("struct G30Pair { uint16_t key; uint16_t cp; };  // key=(lead<<8)|trail，升序")
+out.append("struct G30Seg { uint32_t startOrder, startCp, len; };  // 四字节线性段（order 升序）")
+
+# ---- 双字节表 ----
+entries = []
+leads = set()
+for lead in range(0x81, 0x100):
+    for trail in list(range(0x40, 0x7F)) + list(range(0x80, 0x100)):
+        try:
+            cp = bytes([lead, trail]).decode("gb18030")
+        except Exception:
+            continue
+        if len(cp) != 1:
+            raise SystemExit("multi-char 2byte %02X %02X" % (lead, trail))
+        entries.append(((lead << 8) | trail, ord(cp)))
+        leads.add(lead)
+entries.sort()
+out.append("inline const G30Pair kG30Table[] = {")
+for i in range(0, len(entries), 6):
+    out.append(",".join("{0x%04x,0x%04x}" % e for e in entries[i:i + 6]) + ",")
+out.append("};")
+bits = bytearray(32)
+for l in leads:
+    bits[l // 8] |= 1 << (l % 8)
+out.append("inline const unsigned char kG30Leads[32] = {%s};" %
+           ",".join("0x%02x" % b for b in bits))
+print("2byte: %d pairs, %d leads" % (len(entries), len(leads)), file=sys.stderr)
+
+# ---- 四字节段表 ----
+def seq_of(order):
+    b3 = 0x30 + order % 10
+    t = order // 10
+    b2 = 0x81 + t % 126
+    t2 = t // 126
+    b1 = 0x30 + t2 % 10
+    b0 = 0x81 + t2 // 10
+    return bytes([b0, b1, b2, b3])
+
+MAX_ORDER = (126 * 10) * 126 * 10  # b0 区126 * b1区10 * b2区126 * b3区10
+segs = []
+cur = None
+n4 = 0
+for order in range(MAX_ORDER):
+    seq = seq_of(order)
+    try:
+        s = seq.decode("gb18030")
+    except Exception:
+        s = None
+    if s is None or len(s) != 1:
+        cp = None
+    else:
+        cp = ord(s)
+    if cp is None:
+        if cur is not None:
+            segs.append(cur); cur = None
+        continue
+    n4 += 1
+    if cur is not None and cur[1] + cur[2] == cp and cur[0] + cur[2] == order:
+        cur[2] += 1                              # 线性延续
+    else:
+        if cur is not None:
+            segs.append(cur)
+        cur = [order, cp, 1]
+if cur is not None:
+    segs.append(cur)
+out.append("inline const G30Seg kG30Segs[] = {")
+for i in range(0, len(segs), 3):
+    out.append(",".join("{%d,%d,%d}" % (s[0], s[1], s[2]) for s in segs[i:i + 3]) + ",")
+out.append("};")
+out.append("inline const int kG30SegCount = %d;" % len(segs))
+print("4byte: %d valid orders in %d linear segs" % (n4, len(segs)), file=sys.stderr)
+
+out.append("} // namespace sncom")
+dst = "src/core/gb18030_tables.h"
+with open(dst, "w", encoding="utf-8", newline="\n") as f:
+    f.write("\n".join(out) + "\n")
+print("written", dst, file=sys.stderr)

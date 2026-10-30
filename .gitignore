@@ -1,0 +1,40 @@
+# 构建产物
+dist/
+*.obj
+*.res
+*.pdb
+*.log
+
+# 用户运行时配置与数据
+sncom.json
+SNCom-Log-*.txt
+received.txt
+received.bin
+
+# 探针临时输出
+_probe/out/
+.mimosa/
+
+# 工具产物（§59 审查 P3-5：nettest/hexself 为构建产物不入库；§99 U8：_cc_* 为校验跑批残留）
+tools/out/
+tools/_cc_dump/
+tools/_cc_*
+tools/*.exe
+
+# 协议自测默认输出（§136 R25-P3-7：tools\protofileself.exe 无参直跑在 CWD 落 proto_self.txt；
+# 正规批跑 runcross.bat 传 _cc_proto.txt，已被上面 _cc_* 覆盖）
+proto_self.txt
+
+# 折行调试残留（§62 误入库，删除防复发）
+_wrap_dbg.txt
+_sb_dbg.txt
+
+# Python 缓存（§105：验证脚本 import tools/ 下模块时会生成）
+__pycache__/
+
+# ---- §143：docs/probes/codex/handoff 入库（仓库外目录收编）后的瞬态排除 ----
+probes/_probe/
+probes/_bin/
+probes/_bin_r141a/
+probes/_dcz/
+probes/__pycache__/
